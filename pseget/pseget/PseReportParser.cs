@@ -82,9 +82,18 @@ namespace Pseget
 
         private static IEnumerable<StockModel> GetIndexes(string pdfText)
         {
-            const string pattern = @"(Financials|Industrials|Holding Firms|Property|Services|Mining & Oil|PSEI|All Shares)\s+(((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){8}|((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){6})";
+            // In recent reports, PSE renamed some labels: "Industrials" -> "Industrial", "PSEI" -> "PSEi"
+            // Accept both spellings so old and new reports both parse.
+            // Edited by ValMan
+            const string pattern = @"(Financials|Industrials|Industrial|Holding Firms|Property|Services|Mining\s*&\s*Oil|PSEI|PSEi|All Shares)\s+(((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){8}|((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){6})";
             var matches = Regex.Matches(pdfText, pattern);
-            if (matches.Count != 8) throw new Exception("Unable to parse index values");
+            if (matches.Count != 8)
+            {
+                var found = string.Join(", ", matches.Select(m => m.Groups[1].Value.Trim()));
+                throw new Exception(
+                    $"Unable to parse index values. Expected 8 sectoral summary rows but found {matches.Count}: [{found}]. " +
+                    "The report layout or index labels may have changed.");
+            }
 
             var result = new List<StockModel>();
             foreach (var match in matches.AsEnumerable())
@@ -92,24 +101,35 @@ namespace Pseget
                 var line = match.Groups[0].Value.Trim();
                 var description = match.Groups[1].Value.Trim();
                 var numbers = line
-                        .Split(' ')
+                        .Split(WhitespaceChars, StringSplitOptions.RemoveEmptyEntries)
                         .Reverse()
                         .ToArray();
                 var netForeign = 0m;
-                if (description == "PSEI" || description == "All Shares")
+
+                // Edited by ValMan
+                // Because PSE changed PSEI to PSEi...
+                var isPsei = description.Equals("PSEi", StringComparison.OrdinalIgnoreCase);
+                if (isPsei || description == "All Shares")
                 {
                     var temp = numbers
                         .Take(6)
                         .Select(x => x.Trim())
                         .ToList();
 
-                    if (description == "PSEI")
+                    if (isPsei)
                     {
-                        var grandTotal = Regex.Match(pdfText, @"(GRAND TOTAL)(((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){8}|((((\(?\d{1,3}(,\d{3})*(\.\d+)?\)?))|-)\s|\n){2})");
-                        if (!grandTotal.Success) throw new Exception("Unable to find GRAND TOTAL");
-                        var totals = grandTotal.Groups[2].Value.Split(' ');
-                        temp.Insert(0, totals[1].Trim()); // psei value
-                        temp.Insert(1, totals[0].Trim()); // pseri volume                        
+                        // Edited by ValMan
+                        // Read the two numbers that follow the GRAND TOTAL label, regardless of
+                        // how much whitespace the PDF text extractor puts between them.
+                        var totals = GetNumbersAfterLabel(pdfText, @"GRAND\s*TOTAL", 2);
+                        if (totals == null)
+                        {
+                            throw new Exception(
+                                "Unable to find GRAND TOTAL. Expected a volume and a value immediately after " +
+                                "the 'GRAND TOTAL' label in the sectoral summary.");
+                        }
+                        temp.Insert(0, totals[1]); // psei value
+                        temp.Insert(1, totals[0]); // psei volume
                         netForeign = GetNetForeign(pdfText);
                     }
                     else
@@ -149,11 +169,42 @@ namespace Pseget
 
         private static decimal GetNetForeign(string pdfText)
         {
-            const string pattern = @"(NET FOREIGN BUYING/\(SELLING\)\: Php)\s+(\S+)";
-            var match = Regex.Match(pdfText, pattern);
-            if (!match.Success) throw new Exception("Unable to find NFB");
+            // Edited by ValMan
+            // PSE changed the currency label changed from "Php" to "PHP"; match either, and tolerate
+            // any amount of whitespace before the amount.
+            var numbers = GetNumbersAfterLabel(pdfText, @"NET\s*FOREIGN\s*BUYING/\(SELLING\)\:\s*(?i:php)", 1);
+            if (numbers == null) throw new Exception("Unable to find NFB");
 
-            return decimal.Parse(match.Groups[2].Value.Trim(), NumberStyles.Any);
+            return decimal.Parse(numbers[0], NumberStyles.Any);
+        }
+
+        private static readonly char[] WhitespaceChars = { ' ', '\t', '\r', '\n', '\f', '\u00a0' };
+
+        private static readonly Regex NumberTokenRegex =
+            new Regex(@"^(\(?-?\d{1,3}(,\d{3})*(\.\d+)?\)?|-)$", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Returns the first <paramref name="count"/> numeric tokens that immediately follow
+        /// <paramref name="labelPattern"/>, ignoring how the extracted PDF text is spaced or
+        /// wrapped. Returns null when the label is absent or is not followed by enough numbers.
+        /// </summary>
+        private static string[] GetNumbersAfterLabel(string pdfText, string labelPattern, int count)
+        {
+            foreach (var label in Regex.Matches(pdfText, labelPattern).AsEnumerable())
+            {
+                var tail = pdfText.Substring(label.Index + label.Length);
+                if (tail.Length > 400) tail = tail.Substring(0, 400);
+
+                var tokens = new List<string>();
+                foreach (var token in tail.Split(WhitespaceChars, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (!NumberTokenRegex.IsMatch(token)) break;
+                    tokens.Add(token);
+                    if (tokens.Count == count) return tokens.ToArray();
+                }
+            }
+
+            return null;
         }
 
         private const string Financials = "^FINANCIALS";
@@ -171,12 +222,14 @@ namespace Pseget
             {
                 "Financials" => Financials,
                 "Industrials" => Industrials,
+                "Industrial" => Industrials,
                 "Holding Firms" => Holding,
                 "Property" => Property,
                 "Services" => Services,
                 "Mining & Oil" => Mining,
                 "All Shares" => AllShares,
                 "PSEI" => PSEi,
+                "PSEi" => PSEi,
                 _ => throw new InvalidOperationException($"{indexName} is unknown")
             };
         }
@@ -196,43 +249,43 @@ namespace Pseget
             
             var sector = stockModels.SingleOrDefault(index => index.Symbol == Financials);
             var stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
 
             pattern = @"I N D U S T R I A L((.|\n)+)INDUSTRIAL SECTOR TOTAL";
             matchText = Regex.Match(pdfText, pattern).Value;
             sector = stockModels.SingleOrDefault(index => index.Symbol == Industrials);
             stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
 
             pattern = @"H O L D I N G  F I R M S((.|\n)+)HOLDING FIRMS SECTOR TOTAL";
             matchText = Regex.Match(pdfText, pattern).Value;
             sector = stockModels.SingleOrDefault(index => index.Symbol == Holding);
             stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
 
             pattern = @"P R O P E R T Y((.|\n)+)PROPERTY SECTOR TOTAL";
             matchText = Regex.Match(pdfText, pattern).Value;
             sector = stockModels.SingleOrDefault(index => index.Symbol == Property);
             stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
 
             pattern = @"S E R V I C E S((.|\n)+)SERVICES SECTOR TOTAL";
             matchText = Regex.Match(pdfText, pattern).Value;
             sector = stockModels.SingleOrDefault(index => index.Symbol == Services);
             stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
 
             pattern = @"M I N I N G  &  O I L((.|\n)+)MINING & OIL SECTOR TOTAL";
             matchText = Regex.Match(pdfText, pattern).Value;
             sector = stockModels.SingleOrDefault(index => index.Symbol == Mining);
             stocksInSector = GetStocks(matchText);
-            sector.NetForeignBuy = stocksInSector
-                .Sum(stock => stock.NetForeignBuy);
+            sector.NetForeignBuy = stocksInSector?
+                .Sum(stock => stock.NetForeignBuy) ?? 0m;
         }
     }
 }
